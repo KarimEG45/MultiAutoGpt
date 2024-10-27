@@ -2,6 +2,8 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
+from pydantic import SecretStr
+
 if TYPE_CHECKING:
     from redis import Redis
     from backend.executor.database import DatabaseManager
@@ -10,6 +12,7 @@ from autogpt_libs.utils.cache import thread_cached_property
 from autogpt_libs.utils.synchronize import RedisKeyedMutex
 
 from .types import (
+    APIKeyCredentials,
     Credentials,
     OAuth2Credentials,
     OAuthState,
@@ -17,15 +20,80 @@ from .types import (
     UserMetadataRaw,
 )
 
+from backend.util.settings import Settings
+
+settings = Settings()
+
+revid_credentials = APIKeyCredentials(
+    id="fdb7f412-f519-48d1-9b5f-d2f73d0e01fe",
+    provider="revid",
+    api_key=SecretStr(settings.secrets.revid_api_key),
+    title="Use Credits for Revid",
+    expires_at=None,
+)
+ideogram_credentials = APIKeyCredentials(
+    id="760f84fc-b270-42de-91f6-08efe1b512d0",
+    provider="ideogram",
+    api_key=SecretStr(settings.secrets.ideogram_api_key),
+    title="Use Credits for Ideogram",
+    expires_at=None,
+)
+replicate_credentials = APIKeyCredentials(
+    id="6b9fc200-4726-4973-86c9-cd526f5ce5db",
+    provider="replicate",
+    api_key=SecretStr(settings.secrets.replicate_api_key),
+    title="Use Credits for Replicate",
+    expires_at=None,
+)
+openai_credentials = APIKeyCredentials(
+    id="53c25cb8-e3ee-465c-a4d1-e75a4c899c2a",
+    provider="openai",
+    api_key=SecretStr(settings.secrets.openai_api_key),
+    title="Use Credits for OpenAI",
+    expires_at=None,
+)
+anthropic_credentials = APIKeyCredentials(
+    id="24e5d942-d9e3-4798-8151-90143ee55629",
+    provider="anthropic",
+    api_key=SecretStr(settings.secrets.anthropic_api_key),
+    title="Use Credits for Anthropic",
+    expires_at=None,
+)
+groq_credentials = APIKeyCredentials(
+    id="4ec22295-8f97-4dd1-b42b-2c6957a02545",
+    provider="groq",
+    api_key=SecretStr(settings.secrets.groq_api_key),
+    title="Use Credits for Groq",
+    expires_at=None,
+)
+did_credentials = APIKeyCredentials(
+    id="7f7b0654-c36b-4565-8fa7-9a52575dfae2",
+    provider="d_id",
+    api_key=SecretStr(settings.secrets.did_api_key),
+    title="Use Credits for D-ID",
+    expires_at=None,
+)
+
+DEFAULT_CREDENTIALS = [
+    revid_credentials,
+    ideogram_credentials,
+    replicate_credentials,
+    openai_credentials,
+    anthropic_credentials,
+    groq_credentials,
+    did_credentials,
+]
+
 
 class SupabaseIntegrationCredentialsStore:
     def __init__(self, redis: "Redis"):
         self.locks = RedisKeyedMutex(redis)
-        
+
     @thread_cached_property
     def db_manager(self) -> "DatabaseManager":
         from backend.executor.database import DatabaseManager
         from backend.util.service import get_service_client
+
         return get_service_client(DatabaseManager)
 
     def add_creds(self, user_id: str, credentials: Credentials) -> None:
@@ -41,9 +109,25 @@ class SupabaseIntegrationCredentialsStore:
 
     def get_all_creds(self, user_id: str) -> list[Credentials]:
         user_metadata = self._get_user_metadata(user_id)
-        return UserMetadata.model_validate(
+        users_credentials = UserMetadata.model_validate(
             user_metadata.model_dump()
         ).integration_credentials
+        all_credentials = users_credentials
+        if settings.secrets.revid_api_key:
+            all_credentials.append(revid_credentials)
+        if settings.secrets.ideogram_api_key:
+            all_credentials.append(ideogram_credentials)
+        if settings.secrets.groq_api_key:
+            all_credentials.append(groq_credentials)
+        if settings.secrets.replicate_api_key:
+            all_credentials.append(replicate_credentials)
+        if settings.secrets.openai_api_key:
+            all_credentials.append(openai_credentials)
+        if settings.secrets.anthropic_api_key:
+            all_credentials.append(anthropic_credentials)
+        if settings.secrets.did_api_key:
+            all_credentials.append(did_credentials)
+        return all_credentials
 
     def get_creds_by_id(self, user_id: str, credentials_id: str) -> Credentials | None:
         all_credentials = self.get_all_creds(user_id)
@@ -181,6 +265,8 @@ class SupabaseIntegrationCredentialsStore:
         self, user_id: str, credentials: list[Credentials]
     ) -> None:
         raw_metadata = self._get_user_metadata(user_id)
+        # Remove default credentials from the list
+        credentials = [c for c in credentials if c not in DEFAULT_CREDENTIALS]
         raw_metadata.integration_credentials = [c.model_dump() for c in credentials]
         self.db_manager.update_user_metadata(user_id, raw_metadata)
 
