@@ -4,14 +4,14 @@ import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from functools import wraps
-from typing import Annotated, Any, Dict
+from typing import TYPE_CHECKING, Annotated, Any, Dict
 
 import uvicorn
 from autogpt_libs.auth.middleware import auth_middleware
 from autogpt_libs.utils.cache import thread_cached
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 from typing_extensions import TypedDict
 
 from backend.data import block, db
@@ -21,11 +21,19 @@ from backend.data.block import BlockInput, CompletedBlockOutput
 from backend.data.credit import get_block_costs, get_user_credit_model
 from backend.data.user import get_or_create_user
 from backend.executor import ExecutionManager, ExecutionScheduler
+from backend.integrations.creds_manager import IntegrationCredentialsManager
+from backend.integrations.webhooks.graph_lifecycle_hooks import (
+    on_graph_activate,
+    on_graph_deactivate,
+)
 from backend.server.model import CreateGraph, SetGraphActiveVersion
 from backend.util.service import AppService, get_service_client
 from backend.util.settings import AppEnvironment, Config, Settings
 
 from .utils import get_user_id
+
+if TYPE_CHECKING:
+    from autogpt_libs.supabase_integration_credentials_store.types import Credentials
 
 settings = Settings()
 logger = logging.getLogger(__name__)
@@ -71,14 +79,6 @@ class AgentServer(AppService):
             f"FastAPI CORS allow origins: {Config().backend_cors_allow_origins}"
         )
 
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=Config().backend_cors_allow_origins,
-            allow_credentials=True,
-            allow_methods=["*"],  # Allows all methods
-            allow_headers=["*"],  # Allows all headers
-        )
-
         health_router = APIRouter()
         health_router.add_api_route(
             path="/health",
@@ -94,6 +94,8 @@ class AgentServer(AppService):
         # Import & Attach sub-routers
         import backend.server.integrations.router
         import backend.server.routers.analytics
+
+        self.integration_creds_manager = IntegrationCredentialsManager()
 
         api_router.include_router(
             backend.server.integrations.router.router,
@@ -267,10 +269,18 @@ class AgentServer(AppService):
             tags=["settings"],
         )
 
-        app.add_exception_handler(500, self.handle_internal_http_error)
-
+        app.add_exception_handler(ValueError, self.handle_internal_http_error(400))
+        app.add_exception_handler(500, self.handle_internal_http_error(500))
         app.include_router(api_router)
         app.include_router(health_router)
+
+        app = CORSMiddleware(
+            app=app,
+            allow_origins=Config().backend_cors_allow_origins,
+            allow_credentials=True,
+            allow_methods=["*"],  # Allows all methods
+            allow_headers=["*"],  # Allows all headers
+        )
 
         uvicorn.run(
             app,
@@ -319,14 +329,19 @@ class AgentServer(AppService):
         return get_service_client(ExecutionScheduler)
 
     @classmethod
-    def handle_internal_http_error(cls, request: Request, exc: Exception):
-        return JSONResponse(
-            content={
-                "message": f"{request.method} {request.url.path} failed",
-                "error": str(exc),
-            },
-            status_code=500,
-        )
+    def handle_internal_http_error(cls, status_code: int = 500, log_error: bool = True):
+        def handler(request: Request, exc: Exception):
+            if log_error:
+                logger.exception(f"{request.method} {request.url.path} failed: {exc}")
+            return JSONResponse(
+                content={
+                    "message": f"{request.method} {request.url.path} failed",
+                    "detail": str(exc),
+                },
+                status_code=status_code,
+            )
+
+        return handler
 
     @classmethod
     async def get_or_create_user_route(cls, user_data: dict = Depends(auth_middleware)):
@@ -357,7 +372,7 @@ class AgentServer(AppService):
         cls,
         user_id: Annotated[str, Depends(get_user_id)],
         with_runs: bool = False,
-    ) -> list[graph_db.GraphMeta]:
+    ) -> list[graph_db.GraphMetaModel]:
         return await graph_db.get_graphs_meta(
             include_executions=with_runs, filter_by="active", user_id=user_id
         )
@@ -365,7 +380,7 @@ class AgentServer(AppService):
     @classmethod
     async def get_templates(
         cls, user_id: Annotated[str, Depends(get_user_id)]
-    ) -> list[graph_db.GraphMeta]:
+    ) -> list[graph_db.GraphMetaModel]:
         return await graph_db.get_graphs_meta(filter_by="template", user_id=user_id)
 
     @classmethod
@@ -375,7 +390,7 @@ class AgentServer(AppService):
         user_id: Annotated[str, Depends(get_user_id)],
         version: int | None = None,
         hide_credentials: bool = False,
-    ) -> graph_db.Graph:
+    ) -> graph_db.GraphModel:
         graph = await graph_db.get_graph(
             graph_id, version, user_id=user_id, hide_credentials=hide_credentials
         )
@@ -386,7 +401,7 @@ class AgentServer(AppService):
     @classmethod
     async def get_template(
         cls, graph_id: str, version: int | None = None
-    ) -> graph_db.Graph:
+    ) -> graph_db.GraphModel:
         graph = await graph_db.get_graph(graph_id, version, template=True)
         if not graph:
             raise HTTPException(
@@ -397,23 +412,21 @@ class AgentServer(AppService):
     @classmethod
     async def get_graph_all_versions(
         cls, graph_id: str, user_id: Annotated[str, Depends(get_user_id)]
-    ) -> list[graph_db.Graph]:
+    ) -> list[graph_db.GraphModel]:
         graphs = await graph_db.get_graph_all_versions(graph_id, user_id=user_id)
         if not graphs:
             raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
         return graphs
 
-    @classmethod
     async def create_new_graph(
-        cls, create_graph: CreateGraph, user_id: Annotated[str, Depends(get_user_id)]
-    ) -> graph_db.Graph:
-        return await cls.create_graph(create_graph, is_template=False, user_id=user_id)
+        self, create_graph: CreateGraph, user_id: Annotated[str, Depends(get_user_id)]
+    ) -> graph_db.GraphModel:
+        return await self.create_graph(create_graph, is_template=False, user_id=user_id)
 
-    @classmethod
     async def create_new_template(
-        cls, create_graph: CreateGraph, user_id: Annotated[str, Depends(get_user_id)]
-    ) -> graph_db.Graph:
-        return await cls.create_graph(create_graph, is_template=True, user_id=user_id)
+        self, create_graph: CreateGraph, user_id: Annotated[str, Depends(get_user_id)]
+    ) -> graph_db.GraphModel:
+        return await self.create_graph(create_graph, is_template=True, user_id=user_id)
 
     class DeleteGraphResponse(TypedDict):
         version_counts: int
@@ -426,17 +439,16 @@ class AgentServer(AppService):
             "version_counts": await graph_db.delete_graph(graph_id, user_id=user_id)
         }
 
-    @classmethod
     async def create_graph(
-        cls,
+        self,
         create_graph: CreateGraph,
         is_template: bool,
         # user_id doesn't have to be annotated like on other endpoints,
         # because create_graph isn't used directly as an endpoint
         user_id: str,
-    ) -> graph_db.Graph:
+    ) -> graph_db.GraphModel:
         if create_graph.graph:
-            graph = create_graph.graph
+            graph = graph_db.make_graph_model(create_graph.graph, user_id)
         elif create_graph.template_id:
             # Create a new graph from a template
             graph = await graph_db.get_graph(
@@ -459,15 +471,19 @@ class AgentServer(AppService):
         graph.is_active = not is_template
         graph.reassign_ids(reassign_graph_id=True)
 
-        return await graph_db.create_graph(graph, user_id=user_id)
+        graph = await graph_db.create_graph(graph, user_id=user_id)
+        graph = await on_graph_activate(
+            graph,
+            get_credentials=lambda id: self.integration_creds_manager.get(user_id, id),
+        )
+        return graph
 
-    @classmethod
     async def update_graph(
-        cls,
+        self,
         graph_id: str,
         graph: graph_db.Graph,
         user_id: Annotated[str, Depends(get_user_id)],
-    ) -> graph_db.Graph:
+    ) -> graph_db.GraphModel:
         # Sanity check
         if graph.id and graph.id != graph_id:
             raise HTTPException(400, detail="Graph ID does not match ID in URI")
@@ -484,40 +500,79 @@ class AgentServer(AppService):
         latest_version_graph = next(
             v for v in existing_versions if v.version == latest_version_number
         )
+        current_active_version = next(
+            (v for v in existing_versions if v.is_active), None
+        )
         if latest_version_graph.is_template != graph.is_template:
             raise HTTPException(
                 400, detail="Changing is_template on an existing graph is forbidden"
             )
         graph.is_active = not graph.is_template
+        graph = graph_db.make_graph_model(graph, user_id)
         graph.reassign_ids()
 
         new_graph_version = await graph_db.create_graph(graph, user_id=user_id)
 
         if new_graph_version.is_active:
+
+            def get_credentials(credentials_id: str) -> "Credentials | None":
+                return self.integration_creds_manager.get(user_id, credentials_id)
+
+            # Handle activation of the new graph first to ensure continuity
+            new_graph_version = await on_graph_activate(
+                new_graph_version,
+                get_credentials=get_credentials,
+            )
             # Ensure new version is the only active version
             await graph_db.set_graph_active_version(
                 graph_id=graph_id, version=new_graph_version.version, user_id=user_id
             )
+            if current_active_version:
+                # Handle deactivation of the previously active version
+                await on_graph_deactivate(
+                    current_active_version,
+                    get_credentials=get_credentials,
+                )
 
         return new_graph_version
 
-    @classmethod
     async def set_graph_active_version(
-        cls,
+        self,
         graph_id: str,
         request_body: SetGraphActiveVersion,
         user_id: Annotated[str, Depends(get_user_id)],
     ):
         new_active_version = request_body.active_graph_version
-        if not await graph_db.get_graph(graph_id, new_active_version, user_id=user_id):
+        new_active_graph = await graph_db.get_graph(
+            graph_id, new_active_version, user_id=user_id
+        )
+        if not new_active_graph:
             raise HTTPException(
                 404, f"Graph #{graph_id} v{new_active_version} not found"
             )
+
+        current_active_graph = await graph_db.get_graph(graph_id, user_id=user_id)
+
+        def get_credentials(credentials_id: str) -> "Credentials | None":
+            return self.integration_creds_manager.get(user_id, credentials_id)
+
+        # Handle activation of the new graph first to ensure continuity
+        await on_graph_activate(
+            new_active_graph,
+            get_credentials=get_credentials,
+        )
+        # Ensure new version is the only active version
         await graph_db.set_graph_active_version(
             graph_id=graph_id,
-            version=request_body.active_graph_version,
+            version=new_active_version,
             user_id=user_id,
         )
+        if current_active_graph and current_active_graph.version != new_active_version:
+            # Handle deactivation of the previously active version
+            await on_graph_deactivate(
+                current_active_graph,
+                get_credentials=get_credentials,
+            )
 
     def execute_graph(
         self,
