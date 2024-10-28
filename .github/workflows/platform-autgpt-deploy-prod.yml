@@ -104,7 +104,7 @@ jobs:
 
     - name: Build and Push Backend
       if: steps.check_changes.outputs.backend_changed == 'true'
-      uses: docker/build-push-action@v2
+      uses: docker/build-push-action@v6
       with:
         context: .
         file: ./autogpt_platform/backend/Dockerfile
@@ -115,7 +115,7 @@ jobs:
 
     - name: Build and Push Frontend
       if: steps.check_changes.outputs.frontend_changed == 'true'
-      uses: docker/build-push-action@v2
+      uses: docker/build-push-action@v6
       with:
         context: .
         file: ./autogpt_platform/frontend/Dockerfile
@@ -126,7 +126,7 @@ jobs:
 
     - name: Build and Push Market
       if: steps.check_changes.outputs.market_changed == 'true'
-      uses: docker/build-push-action@v2
+      uses: docker/build-push-action@v6
       with:
         context: .
         file: ./autogpt_platform/market/Dockerfile
